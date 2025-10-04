@@ -10,26 +10,25 @@ let companies = [];
 let users = [];
 let expenses = [];
 let approvalRules = [];
+let approvalFlows = [];
 
 // Currency conversion helper
-async function convertCurrency(amount, fromCurrency, toCurrency) {
-  // Mock conversion rates for demo
-  const rates = {
-    USD: { EUR: 0.85, INR: 83, GBP: 0.73 },
-    EUR: { USD: 1.18, INR: 87, GBP: 0.86 },
-    INR: { USD: 0.012, EUR: 0.011, GBP: 0.0096 },
-    GBP: { USD: 1.37, EUR: 1.16, INR: 100 }
-  };
-  
-  if (fromCurrency === toCurrency) return amount;
-  return amount * (rates[fromCurrency]?.[toCurrency] || 1);
+const exchangeRates = {
+  USD: { EUR: 0.85, INR: 83, GBP: 0.73, USD: 1 },
+  EUR: { USD: 1.18, INR: 87, GBP: 0.86, EUR: 1 },
+  INR: { USD: 0.012, EUR: 0.011, GBP: 0.0096, INR: 1 },
+  GBP: { USD: 1.37, EUR: 1.16, INR: 100, GBP: 1 }
+};
+
+function convertCurrency(amount, fromCurrency, toCurrency) {
+  return amount * (exchangeRates[fromCurrency]?.[toCurrency] || 1);
 }
 
-// Auth routes
+// Auto-create company and admin on first signup
 app.post('/api/auth/signup', async (req, res) => {
   const { name, email, password, companyName, country, currency } = req.body;
   
-  // Create company
+  // Create company with selected currency
   const company = {
     id: Date.now().toString(),
     name: companyName,
@@ -48,24 +47,26 @@ app.post('/api/auth/signup', async (req, res) => {
     role: 'admin',
     company: company.id,
     isManagerApprover: true,
+    managerId: null,
     createdAt: new Date()
   };
   users.push(user);
 
-  // Create default approval rule
-  const rule = {
+  // Create default approval flow
+  const approvalFlow = {
     id: Date.now().toString(),
     companyId: company.id,
-    ruleType: 'multi_level',
-    approvalSequence: [
-      { type: 'manager', order: 1 },
-      { type: 'finance', order: 2 }
+    name: 'Default Approval Flow',
+    steps: [
+      { type: 'manager', order: 1, required: true },
+      { type: 'role', role: 'finance', order: 2, required: false }
     ],
+    ruleType: 'multi_level',
     percentageThreshold: 60,
     specificApprover: null,
     isActive: true
   };
-  approvalRules.push(rule);
+  approvalFlows.push(approvalFlow);
   
   res.json({
     token: 'demo-token',
@@ -74,7 +75,8 @@ app.post('/api/auth/signup', async (req, res) => {
       name: user.name,
       email: user.email,
       role: user.role,
-      company: company
+      company: company,
+      isManagerApprover: user.isManagerApprover
     }
   });
 });
@@ -93,7 +95,8 @@ app.post('/api/auth/login', (req, res) => {
         email: user.email,
         role: user.role,
         company: company,
-        isManagerApprover: user.isManagerApprover
+        isManagerApprover: user.isManagerApprover,
+        managerId: user.managerId
       }
     });
   } else {
@@ -101,13 +104,14 @@ app.post('/api/auth/login', (req, res) => {
   }
 });
 
-// User Management
+// User Management - Admin only
 app.get('/api/users', (req, res) => {
   const companyId = req.query.companyId;
   const companyUsers = users.filter(u => u.company === companyId)
     .map(user => ({
       ...user,
-      managerName: users.find(m => m.id === user.managerId)?.name || 'None'
+      managerName: users.find(m => m.id === user.managerId)?.name || 'None',
+      password: undefined // Don't send password back
     }));
   res.json(companyUsers);
 });
@@ -119,7 +123,7 @@ app.post('/api/users', (req, res) => {
     id: Date.now().toString(),
     name,
     email,
-    password: 'welcome123', // Default password
+    password: 'welcome123',
     role: role || 'employee',
     company: companyId,
     managerId: managerId || null,
@@ -128,10 +132,26 @@ app.post('/api/users', (req, res) => {
   };
   
   users.push(user);
-  res.json(user);
+  res.json({ ...user, password: undefined });
 });
 
-// Expense submission with approval workflow
+// Update user role/manager
+app.put('/api/users/:id', (req, res) => {
+  const { role, managerId, isManagerApprover } = req.body;
+  const user = users.find(u => u.id === req.params.id);
+  
+  if (user) {
+    if (role) user.role = role;
+    if (managerId !== undefined) user.managerId = managerId;
+    if (isManagerApprover !== undefined) user.isManagerApprover = isManagerApprover;
+    
+    res.json({ ...user, password: undefined });
+  } else {
+    res.status(404).json({ message: 'User not found' });
+  }
+});
+
+// Expense submission with multi-level approval
 app.post('/api/expenses', async (req, res) => {
   const { amount, currency, category, description, date, employeeId, companyId } = req.body;
   
@@ -143,11 +163,11 @@ app.post('/api/expenses', async (req, res) => {
   }
 
   // Convert to company currency
-  const amountInCompanyCurrency = await convertCurrency(amount, currency, company.currency);
+  const amountInCompanyCurrency = convertCurrency(amount, currency, company.currency);
 
   const expense = {
     id: Date.now().toString(),
-    amount,
+    amount: parseFloat(amount),
     currency,
     amountInCompanyCurrency: Math.round(amountInCompanyCurrency * 100) / 100,
     category,
@@ -159,26 +179,32 @@ app.post('/api/expenses', async (req, res) => {
     status: 'submitted',
     approvalFlow: [],
     currentApproverIndex: 0,
+    approvers: [],
     createdAt: new Date()
   };
 
-  // Initialize approval flow
-  const rule = approvalRules.find(r => r.companyId === companyId && r.isActive);
-  if (rule && rule.ruleType === 'multi_level') {
-    for (const step of rule.approvalSequence) {
-      let approverId = null;
+  // Get active approval flow for company
+  const activeFlow = approvalFlows.find(f => f.companyId === companyId && f.isActive);
+  
+  if (activeFlow) {
+    // Build approval sequence based on flow rules
+    const approvalSequence = [];
+    
+    for (const step of activeFlow.steps) {
+      let approver = null;
       
       if (step.type === 'manager' && employee.managerId) {
-        approverId = employee.managerId;
-      } else if (step.type === 'finance') {
-        // Find finance users
-        const financeUser = users.find(u => u.company === companyId && u.role === 'manager');
-        approverId = financeUser?.id;
+        approver = users.find(u => u.id === employee.managerId && u.isManagerApprover);
+      } else if (step.type === 'role') {
+        approver = users.find(u => u.company === companyId && u.role === step.role && u.isManagerApprover);
+      } else if (step.type === 'specific') {
+        approver = users.find(u => u.id === step.userId);
       }
       
-      if (approverId) {
-        expense.approvalFlow.push({
-          approverId,
+      if (approver) {
+        approvalSequence.push({
+          approverId: approver.id,
+          approverName: approver.name,
           sequenceOrder: step.order,
           status: step.order === 1 ? 'pending' : 'waiting',
           comments: '',
@@ -187,62 +213,58 @@ app.post('/api/expenses', async (req, res) => {
       }
     }
     
-    if (expense.approvalFlow.length > 0) {
+    expense.approvalFlow = approvalSequence;
+    expense.approvers = approvalSequence.map(a => a.approverId);
+    
+    if (approvalSequence.length > 0) {
       expense.status = 'in_review';
     }
   }
 
   expenses.push(expense);
-  
-  // Populate approver names for response
-  const expenseWithDetails = {
-    ...expense,
-    approvalFlow: expense.approvalFlow.map(flow => ({
-      ...flow,
-      approverName: users.find(u => u.id === flow.approverId)?.name || 'Unknown'
-    }))
-  };
-  
-  res.json(expenseWithDetails);
+  res.json(expense);
 });
 
-// Get expenses for user
-app.get('/api/expenses/my-expenses', (req, res) => {
-  const employeeId = req.query.employeeId;
-  const userExpenses = expenses
-    .filter(e => e.employeeId === employeeId)
-    .map(expense => ({
-      ...expense,
-      approvalFlow: expense.approvalFlow.map(flow => ({
-        ...flow,
-        approverName: users.find(u => u.id === flow.approverId)?.name || 'Unknown'
-      }))
-    }));
+// Get expenses for user based on role
+app.get('/api/expenses', (req, res) => {
+  const { userId, companyId, role } = req.query;
+  
+  let userExpenses = [];
+  
+  if (role === 'admin') {
+    // Admin sees all company expenses
+    userExpenses = expenses.filter(e => e.companyId === companyId);
+  } else if (role === 'manager') {
+    // Manager sees team expenses and expenses pending their approval
+    const managedUsers = users.filter(u => u.managerId === userId);
+    const managedUserIds = managedUsers.map(u => u.id);
+    
+    userExpenses = expenses.filter(e => 
+      e.companyId === companyId && 
+      (managedUserIds.includes(e.employeeId) || e.approvers.includes(userId))
+    );
+  } else {
+    // Employee sees only their expenses
+    userExpenses = expenses.filter(e => e.employeeId === userId);
+  }
+  
   res.json(userExpenses);
 });
 
-// Get pending approvals
+// Get pending approvals for manager/admin
 app.get('/api/expenses/pending-approval', (req, res) => {
   const approverId = req.query.approverId;
-  const pendingExpenses = expenses
-    .filter(e => 
-      e.approvalFlow.some(flow => 
-        flow.approverId === approverId && flow.status === 'pending'
-      )
-    )
-    .map(expense => ({
-      ...expense,
-      approvalFlow: expense.approvalFlow.map(flow => ({
-        ...flow,
-        approverName: users.find(u => u.id === flow.approverId)?.name || 'Unknown'
-      }))
-    }));
+  const pendingExpenses = expenses.filter(e => 
+    e.approvalFlow.some(flow => 
+      flow.approverId === approverId && flow.status === 'pending'
+    ) && e.status === 'in_review'
+  );
   res.json(pendingExpenses);
 });
 
-// Approve/Reject expense
+// Approve/Reject expense with comments
 app.post('/api/expenses/:id/approve', (req, res) => {
-  const { action, comments, approverId } = req.body; // action: 'approve' or 'reject'
+  const { action, comments, approverId } = req.body;
   const expense = expenses.find(e => e.id === req.params.id);
   
   if (!expense) {
@@ -261,55 +283,94 @@ app.post('/api/expenses/:id/approve', (req, res) => {
   currentStep.comments = comments;
   currentStep.actedAt = new Date();
 
+  // Get approval flow rules
+  const activeFlow = approvalFlows.find(f => f.companyId === expense.companyId && f.isActive);
+  
   if (action === 'reject') {
     expense.status = 'rejected';
   } else {
-    // Move to next approver or complete
-    const nextStep = expense.approvalFlow.find(step => step.status === 'waiting');
-    if (nextStep) {
-      nextStep.status = 'pending';
-      expense.currentApproverIndex++;
+    // Check approval rules
+    if (activeFlow && activeFlow.ruleType === 'percentage') {
+      const approvedCount = expense.approvalFlow.filter(step => step.status === 'approved').length + 1;
+      const totalApprovers = expense.approvalFlow.length;
+      const approvalPercentage = (approvedCount / totalApprovers) * 100;
+      
+      if (approvalPercentage >= activeFlow.percentageThreshold) {
+        expense.status = 'approved';
+      } else {
+        // Move to next approver
+        const nextStep = expense.approvalFlow.find(step => step.status === 'waiting');
+        if (nextStep) {
+          nextStep.status = 'pending';
+        }
+      }
     } else {
-      expense.status = 'approved';
+      // Multi-level approval - move to next step
+      const nextStep = expense.approvalFlow.find(step => step.status === 'waiting');
+      if (nextStep) {
+        nextStep.status = 'pending';
+      } else {
+        expense.status = 'approved';
+      }
     }
   }
 
   res.json(expense);
 });
 
-// Approval rules management
-app.get('/api/approval-rules', (req, res) => {
+// Approval flows management
+app.get('/api/approval-flows', (req, res) => {
   const companyId = req.query.companyId;
-  const rules = approvalRules.filter(r => r.companyId === companyId);
-  res.json(rules);
+  const flows = approvalFlows.filter(f => f.companyId === companyId);
+  res.json(flows);
 });
 
-app.post('/api/approval-rules', (req, res) => {
-  const { companyId, ruleType, approvalSequence, percentageThreshold, specificApprover } = req.body;
+app.post('/api/approval-flows', (req, res) => {
+  const { companyId, name, steps, ruleType, percentageThreshold, specificApprover } = req.body;
   
-  // Deactivate other rules
-  approvalRules.forEach(rule => {
-    if (rule.companyId === companyId) {
-      rule.isActive = false;
+  // Deactivate other flows
+  approvalFlows.forEach(flow => {
+    if (flow.companyId === companyId) {
+      flow.isActive = false;
     }
   });
 
-  const rule = {
+  const flow = {
     id: Date.now().toString(),
     companyId,
-    ruleType,
-    approvalSequence,
-    percentageThreshold,
-    specificApprover,
+    name,
+    steps,
+    ruleType: ruleType || 'multi_level',
+    percentageThreshold: percentageThreshold || 60,
+    specificApprover: specificApprover || null,
     isActive: true
   };
   
-  approvalRules.push(rule);
-  res.json(rule);
+  approvalFlows.push(flow);
+  res.json(flow);
 });
 
-const PORT = 5000;
+// Override approval (Admin only)
+app.post('/api/expenses/:id/override', (req, res) => {
+  const { action, comments } = req.body;
+  const expense = expenses.find(e => e.id === req.params.id);
+  
+  if (!expense) {
+    return res.status(404).json({ message: 'Expense not found' });
+  }
+
+  expense.status = action;
+  expense.override = {
+    by: req.body.adminId,
+    at: new Date(),
+    comments: comments || `Manually ${action} by admin`
+  };
+  
+  res.json(expense);
+});
+
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Backend running on http://localhost:${PORT}`);
-  console.log(`📊 Features: Multi-level approvals, User management, Currency conversion`);
+  console.log(`🚀 Complete Expense Manager Backend running on port ${PORT}`);
+  console.log(`📊 Features: Multi-level approvals, Flexible rules, Currency conversion, User management`);
 });
